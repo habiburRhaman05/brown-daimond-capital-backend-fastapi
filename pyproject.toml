@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*", "tests*"]
+
+[project]
+name = "bdcap-portal-api"
+version = "0.1.0"
+description = "BDCap Client Portal — FastAPI backend"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.30,<1",
+    "sqlalchemy[asyncio]>=2.0,<3",
+    "asyncpg>=0.30,<1",
+    "pydantic>=2.0,<3",
+    "pydantic-settings>=2.0,<3",
+    "python-jose[cryptography]>=3.3,<4",
+    "bcrypt>=4.1,<6",
+    "httpx>=0.27,<1",
+    "slowapi>=0.1.9,<1",
+    "structlog>=24.0,<26",
+    "python-multipart>=0.0.9",
+    "email-validator>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.24,<1",
+    "httpx",
+    "ruff>=0.6,<1",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
