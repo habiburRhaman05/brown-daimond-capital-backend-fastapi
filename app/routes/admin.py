@@ -45,7 +45,22 @@ async def _optional_json(request: Request) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-# ── clients ────────────────────────────────────────────────────────────────────
+async def _reopen_client_portal_for_change_request(db, admin: Profile, request: ChangeRequest, *, hours: int = 24) -> None:
+    """Allow the client back into the portal once an admin resolves a change request."""
+    profile = await db.get(Profile, request.client_id)
+    if profile is None or profile.role != "client":
+        return
+    data = await svc.load_client(db, profile, create=True)
+    if not svc.is_locked(data.cd):
+        return
+    until = now() + timedelta(hours=hours)
+    data.cd.locked_on = None
+    data.cd.changes_until = until
+    data.cd.updated_at = now()
+    await audit(db, admin.id, "request.resolved_reopen", request.client_id, {"requestId": str(request.id), "hours": hours, "changesUntil": svc.iso(until)})
+
+
+# ── clients ────────────────────────────────────────────────────────────
 @router.get("/clients")
 async def list_clients(_: AdminUser, db: DB):
     profiles = list((await db.execute(select(Profile).where(Profile.role == "client").order_by(Profile.created_at.desc()))).scalars())
@@ -68,7 +83,7 @@ async def client_detail(client_id: str, _: AdminUser, db: DB):
         "requests": [svc.public_request(r, with_client=True) for r in sorted(data.requests, key=lambda r: r.created_at, reverse=True)],
         "audit": [{"id": a.id, "actor_id": str(a.actor_id) if a.actor_id else None, "action": a.action,
                    "client_id": str(a.client_id) if a.client_id else None, "meta": a.meta, "created_at": svc.iso(a.created_at)}
-                  for a in audit_rows],
+                   for a in audit_rows],
     }
 
 
@@ -171,11 +186,13 @@ async def _set_request_status(db, admin: Profile, request_id: str, request: Requ
         cr.resolved_by = admin.id if status == "resolved" else None
         cr.resolved_at = now() if status == "resolved" else None
         cr.updated_at = now()
-        await audit(db, admin.id, f"request.{'resolved' if status == 'resolved' else 'reopened'}", cr.client_id,
+        await audit(db, admin.id, f"request.{ 'resolved' if status == 'resolved' else 'reopened' }", cr.client_id,
                     {"requestId": str(cr.id), "part": cr.part})
     if "note" in body:
         cr.admin_note = note or None
         cr.updated_at = now()
+    if status == "resolved":
+        await _reopen_client_portal_for_change_request(db, admin, cr)
     return {"ok": True, "request": svc.public_request(cr, with_client=True)}
 
 
@@ -189,7 +206,7 @@ async def reopen_request(request_id: str, request: Request, admin: AdminUser, db
     return await _set_request_status(db, admin, request_id, request, "pending")
 
 
-# ── invites ────────────────────────────────────────────────────────────────────
+# ── invites ────────────────────────────────────────────────────────────
 def _invite_json(i: Invite) -> dict:
     return {"id": str(i.id), "email": i.email, "status": i.status, "created_at": svc.iso(i.created_at),
             "accepted_at": svc.iso(i.accepted_at) or None}
