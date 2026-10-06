@@ -4,13 +4,13 @@ from datetime import date, timedelta
 from fastapi import APIRouter, Request
 from sqlalchemy import select
 
-from app.db.models import AuditLog, ChangeRequest, Invite, Profile, SignupRequest
+from app.db.models import AuditLog, ChangeRequest, ClientNumber, Invite, Profile, SignupRequest
 from app.deps import DB, AdminUser, EMAIL_RE, audit, normalize_email, profile_by_email, read_json
 from app.errors import ApiError
 from app.routes.portal import _check_payload, write_answers
 from app.security import now
 from app.services import portal as svc
-from app.services.invites import open_invite, registered, send_invite
+from app.services.invites import create_invite_link, open_invite, registered, send_invite
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -83,6 +83,7 @@ async def client_detail(client_id: str, _: AdminUser, db: DB):
         "status": data.status,
         "site": data.site,
         "requests": [svc.public_request(r, with_client=True) for r in sorted(data.requests, key=lambda r: r.created_at, reverse=True)],
+        "numbers": [{"id": str(n.id), "number": n.number} for n in data.numbers],
         "audit": [{"id": a.id, "actor_id": str(a.actor_id) if a.actor_id else None, "action": a.action,
                    "client_id": str(a.client_id) if a.client_id else None, "meta": a.meta, "created_at": svc.iso(a.created_at)}
                    for a in audit_rows],
@@ -167,6 +168,49 @@ async def lock_portal(client_id: str, admin: AdminUser, db: DB):
     return {"ok": True, "lockedOn": svc.iso(stamp)}
 
 
+# ── client numbers CRUD ───────────────────────────────────────────────────────
+@router.post("/clients/{client_id}/numbers", status_code=201)
+async def add_client_number(client_id: str, request: Request, admin: AdminUser, db: DB):
+    profile = await _client_or_404(db, client_id)
+    body = await read_json(request)
+    number = str(body.get("number") or "").strip()[:60]
+    if not number:
+        raise ApiError(400, "NUMBER_REQUIRED")
+    cn = ClientNumber(client_id=profile.id, number=number)
+    db.add(cn)
+    await db.flush()
+    await audit(db, admin.id, "client_number.added", profile.id, {"number": number})
+    return {"ok": True, "number": {"id": str(cn.id), "number": cn.number}}
+
+
+@router.put("/clients/{client_id}/numbers/{number_id}")
+async def update_client_number(client_id: str, number_id: str, request: Request, admin: AdminUser, db: DB):
+    await _client_or_404(db, client_id)
+    cn = await db.get(ClientNumber, _uuid(number_id, "NUMBER_NOT_FOUND"))
+    if cn is None or str(cn.client_id) != client_id:
+        raise ApiError(404, "NUMBER_NOT_FOUND")
+    body = await read_json(request)
+    number = str(body.get("number") or "").strip()[:60]
+    if not number:
+        raise ApiError(400, "NUMBER_REQUIRED")
+    cn.number = number
+    cn.updated_at = now()
+    await audit(db, admin.id, "client_number.updated", cn.client_id, {"number": number})
+    return {"ok": True, "number": {"id": str(cn.id), "number": cn.number}}
+
+
+@router.delete("/clients/{client_id}/numbers/{number_id}")
+async def delete_client_number(client_id: str, number_id: str, admin: AdminUser, db: DB):
+    await _client_or_404(db, client_id)
+    cn = await db.get(ClientNumber, _uuid(number_id, "NUMBER_NOT_FOUND"))
+    if cn is None or str(cn.client_id) != client_id:
+        raise ApiError(404, "NUMBER_NOT_FOUND")
+    old = cn.number
+    await db.delete(cn)
+    await audit(db, admin.id, "client_number.deleted", cn.client_id, {"number": old})
+    return {"ok": True}
+
+
 # ── change requests: pending <-> resolved, switchable both ways ────────────────
 @router.get("/change-requests")
 async def list_requests(_: AdminUser, db: DB, status: str = ""):
@@ -235,6 +279,25 @@ async def create_invite(request: Request, admin: AdminUser, db: DB):
     await audit(db, admin.id, "invite.sent", None, {"email": email})
     await db.refresh(invite)
     return {"ok": True, "invite": _invite_json(invite)}
+
+
+@router.post("/invites/create-link", status_code=201)
+async def create_invite_link_route(request: Request, admin: AdminUser, db: DB):
+    """Same rules as an emailed invite (tied to the email address, same expiry) but returns
+    the link instead of sending it, so an admin can paste it into their own message."""
+    body = await read_json(request)
+    email = normalize_email(body.get("email"))
+    if not EMAIL_RE.match(email):
+        raise ApiError(400, "INVALID_EMAIL")
+    existing = await profile_by_email(db, email)
+    if registered(existing):
+        raise ApiError(409, "ALREADY_REGISTERED")
+    if await open_invite(db, email) is not None:
+        raise ApiError(409, "INVITE_PENDING")
+    invite, link = await create_invite_link(db, email, admin.id, existing)
+    await audit(db, admin.id, "invite.link_created", None, {"email": email})
+    await db.refresh(invite)
+    return {"ok": True, "invite": _invite_json(invite), "link": link}
 
 
 @router.delete("/invites/{invite_id}")

@@ -29,6 +29,18 @@ class Profile(Base):
     updated_at: Mapped[datetime] = _now()
 
 
+class ClientNumber(Base):
+    """Our team's own reference number(s) for a client. The client never sees or sets these."""
+
+    __tablename__ = "client_numbers"
+
+    id: Mapped[uuid.UUID] = _uuid()
+    client_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("profiles.id", ondelete="CASCADE"))
+    number: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = _now()
+    updated_at: Mapped[datetime] = _now()
+
+
 class AuthToken(Base):
     __tablename__ = "auth_tokens"
 

@@ -7,7 +7,7 @@ from datetime import date, datetime, timezone
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import ChangeRequest, ClientDetail, Profile, SiteConfig, SiteConfigHistory
+from app.db.models import ChangeRequest, ClientDetail, ClientNumber, Profile, SiteConfig, SiteConfigHistory
 from app.security import now
 
 # ── field map: portal key -> client_details column ─────────────────────────────
@@ -168,11 +168,13 @@ def sel_of(cfg: SiteConfig | None, cd: ClientDetail | None, requests: list[Chang
 class ClientData:
     """One client's stored data, loaded together."""
 
-    def __init__(self, profile: Profile, cd: ClientDetail | None, cfg: SiteConfig | None, requests: list[ChangeRequest]):
+    def __init__(self, profile: Profile, cd: ClientDetail | None, cfg: SiteConfig | None, requests: list[ChangeRequest],
+                 numbers: list[ClientNumber] | None = None):
         self.profile = profile
         self.cd = cd
         self.cfg = cfg
         self.requests = requests
+        self.numbers = numbers or []
 
     @property
     def fields(self) -> dict:
@@ -204,11 +206,14 @@ async def load_client(db: AsyncSession, profile: Profile, *, create: bool = Fals
     requests = list((await db.execute(
         select(ChangeRequest).where(ChangeRequest.client_id == profile.id).order_by(ChangeRequest.created_at.desc())
     )).scalars())
-    return ClientData(profile, cd, cfg, requests)
+    numbers = list((await db.execute(
+        select(ClientNumber).where(ClientNumber.client_id == profile.id).order_by(ClientNumber.created_at)
+    )).scalars())
+    return ClientData(profile, cd, cfg, requests, numbers)
 
 
 async def load_many(db: AsyncSession, profiles: list[Profile]) -> list[ClientData]:
-    """All clients for the admin list in four queries, not four per client."""
+    """All clients for the admin list in five queries, not five per client."""
     ids = [p.id for p in profiles]
     if not ids:
         return []
@@ -217,7 +222,10 @@ async def load_many(db: AsyncSession, profiles: list[Profile]) -> list[ClientDat
     reqs: dict[uuid.UUID, list[ChangeRequest]] = {}
     for r in (await db.execute(select(ChangeRequest).where(ChangeRequest.client_id.in_(ids)))).scalars():
         reqs.setdefault(r.client_id, []).append(r)
-    return [ClientData(p, cds.get(p.id), cfgs.get(p.id), reqs.get(p.id, [])) for p in profiles]
+    nums: dict[uuid.UUID, list[ClientNumber]] = {}
+    for n in (await db.execute(select(ClientNumber).where(ClientNumber.client_id.in_(ids)).order_by(ClientNumber.created_at))).scalars():
+        nums.setdefault(n.client_id, []).append(n)
+    return [ClientData(p, cds.get(p.id), cfgs.get(p.id), reqs.get(p.id, []), nums.get(p.id, [])) for p in profiles]
 
 
 async def pending_count(db: AsyncSession, client_id: uuid.UUID) -> int:
@@ -399,6 +407,7 @@ def summarize(data: ClientData, pending: int | None = None) -> dict:
         "progress": p,
         "site": data.site,
         "createdAt": iso(data.profile.created_at),
+        "clientNumbers": [n.number for n in data.numbers],
     }
 
 

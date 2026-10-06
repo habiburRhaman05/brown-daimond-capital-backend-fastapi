@@ -45,6 +45,9 @@ async def post_to_ghl(payload: dict) -> bool:
         return False
 
 
+MAILING_ADDRESS = "Brown Diamond Capital, 3400 Cottage Way, Ste G2 #36795, Sacramento, CA 95825"
+
+
 def _base(kind: str, to_email: str, to_name: str = "") -> dict:
     s = get_settings()
     return {
@@ -54,6 +57,7 @@ def _base(kind: str, to_email: str, to_name: str = "") -> dict:
         "to_email": to_email,
         "to_name": to_name or "",
         "login_url": s.FRONTEND_URL.rstrip("/") + "/client/login",
+        "mailing_address": MAILING_ADDRESS,
     }
 
 
