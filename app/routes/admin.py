@@ -46,13 +46,15 @@ async def _optional_json(request: Request) -> dict:
 
 
 async def _reopen_client_portal_for_change_request(db, admin: Profile, request: ChangeRequest, *, hours: int = 24) -> None:
-    """Allow the client back into the portal once an admin resolves a change request."""
+    """If an admin resolved a change request, the client must be allowed back in the portal for a short window."""
     profile = await db.get(Profile, request.client_id)
     if profile is None or profile.role != "client":
         return
+
     data = await svc.load_client(db, profile, create=True)
-    if not svc.is_locked(data.cd):
+    if data.cd is None:
         return
+
     until = now() + timedelta(hours=hours)
     data.cd.locked_on = None
     data.cd.changes_until = until
