@@ -33,11 +33,13 @@ async def test_signup_requires_verification_then_logs_in(api, outbox):
 
     token = outbox.token_in(email, "verify_email")
     r = await api.get(f"/api/auth/verify-email?token={token}")
-    assert r.status_code == 302 and r.headers["location"].endswith("/client/login?verified=1")
+    assert r.status_code == 302
+    loc = r.headers["location"]
+    assert "/email-verified#" in loc and "type=verify" in loc and "access_token=" in loc
     r = await api.get(f"/api/auth/verify-email?token={token}")  # a mail scanner may open it twice
-    assert r.headers["location"].endswith("/client/login?verified=1")
+    assert r.headers["location"].endswith("/email-verified?status=already")  # no session on replay
     r = await api.get("/api/auth/verify-email?token=nonsense")
-    assert r.headers["location"].endswith("/client/login?verify=expired")
+    assert r.headers["location"].endswith("/email-verified?status=expired")
 
     r = await api.post("/api/auth/login", json={"email": email.upper(), "password": pw})
     assert r.status_code == 200

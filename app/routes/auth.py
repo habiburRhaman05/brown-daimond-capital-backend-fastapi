@@ -78,17 +78,24 @@ async def resend_verification(request: Request, db: DB, background: BackgroundTa
 @router.get("/verify-email")
 @limiter.limit("60/15 minutes")
 async def verify_email(request: Request, db: DB, token: str = ""):
+    """Lands on /email-verified. Only the click that actually performs the verification
+    (the first one) gets a one-time session in the redirect fragment, same mechanism as
+    /redeem. A mail scanner may open the link before the person does, or the person may
+    open a forwarded/stale copy afterwards; either way that replay gets no session at all,
+    just the "already verified" state, so the link can never become a reusable backdoor."""
     row = await tokens.find_link_token(db, token, ("verify_email",))
     user = await db.get(Profile, row.user_id) if row is not None else None
-    # A mail scanner may open the link before the person does, so a link that was already
-    # used still counts as success once the address is verified.
     if user is None or not user.is_active or (row.expires_at <= now() and user.email_verified_at is None):
-        return RedirectResponse(_frontend("/client/login?verify=expired"), status_code=302, headers=_NO_STORE)
+        return RedirectResponse(_frontend("/email-verified?status=expired"), status_code=302, headers=_NO_STORE)
     if user.email_verified_at is None:
         user.email_verified_at = now()
         row.used_at = now()
         await audit(db, user.id, "email.verified", user.id)
-    return RedirectResponse(_frontend("/client/login?verified=1"), status_code=302, headers=_NO_STORE)
+        session = await tokens.issue_session(db, user, with_user=False)
+        fragment = (f"access_token={session['access_token']}&refresh_token={session['refresh_token']}"
+                    f"&expires_in={session['expires_in']}&type=verify")
+        return RedirectResponse(_frontend("/email-verified#" + fragment), status_code=302, headers=_NO_STORE)
+    return RedirectResponse(_frontend("/email-verified?status=already"), status_code=302, headers=_NO_STORE)
 
 
 @router.post("/login")
