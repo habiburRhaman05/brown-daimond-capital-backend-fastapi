@@ -14,7 +14,14 @@ REFRESH_REUSE_GRACE = timedelta(seconds=30)
 
 
 def user_json(user: Profile) -> dict:
-    return {"id": str(user.id), "email": user.email, "role": user.role}
+    return {
+        "id": str(user.id),
+        "email": user.email,
+        "role": user.role,
+        "fullName": user.full_name or "",
+        "avatarUrl": user.avatar_url or "",
+        "phone": user.phone or "",
+    }
 
 
 async def issue_session(db: AsyncSession, user: Profile, *, with_user: bool = True) -> dict:

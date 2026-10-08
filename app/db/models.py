@@ -22,6 +22,8 @@ class Profile(Base):
     full_name: Mapped[str] = mapped_column(Text, default="")
     password_hash: Mapped[str | None] = mapped_column(Text)
     role: Mapped[str] = mapped_column(Text, default="client")
+    avatar_url: Mapped[str | None] = mapped_column(Text)
+    phone: Mapped[str | None] = mapped_column(Text)
     email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

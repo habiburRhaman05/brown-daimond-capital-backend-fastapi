@@ -1,6 +1,6 @@
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, Request
+from fastapi import APIRouter, BackgroundTasks, Request, UploadFile
 from fastapi.responses import RedirectResponse
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
@@ -13,6 +13,7 @@ from app.errors import ApiError
 from app.limiter import limiter
 from app.security import TokenError, decode_access_token, expiry, hash_password, now, password_ok, verify_password
 from app.services import tokens
+from app.services.storage import ALLOWED_TYPES, MAX_SIZE, is_configured as storage_configured, upload_avatar
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -212,4 +213,46 @@ async def change_password(request: Request, user: CurrentUser, db: DB):
 
 @router.get("/me")
 async def me(user: CurrentUser):
+    return {"user": tokens.user_json(user)}
+
+
+@router.put("/profile")
+async def update_profile(request: Request, user: CurrentUser, db: DB):
+    body = await read_json(request)
+    changed = False
+    name = body.get("fullName")
+    if isinstance(name, str):
+        user.full_name = name.strip()[:120]
+        changed = True
+    phone = body.get("phone")
+    if isinstance(phone, str):
+        user.phone = phone.strip()[:30] or None
+        changed = True
+    if changed:
+        user.updated_at = now()
+        await audit(db, user.id, "profile.updated", user.id if user.role == "client" else None)
+    return {"user": tokens.user_json(user)}
+
+
+@router.post("/avatar")
+@limiter.limit("20/15 minutes")
+async def upload_avatar_endpoint(request: Request, user: CurrentUser, db: DB, file: UploadFile):
+    if not storage_configured():
+        raise ApiError(503, "STORAGE_NOT_CONFIGURED", "Avatar upload is not available. Configure Supabase storage first.")
+    if file.content_type not in ALLOWED_TYPES:
+        raise ApiError(400, "INVALID_FILE_TYPE", f"Allowed types: {', '.join(sorted(ALLOWED_TYPES))}")
+    data = await file.read()
+    if len(data) > MAX_SIZE:
+        raise ApiError(400, "FILE_TOO_LARGE", "Maximum file size is 2 MB.")
+    url = await upload_avatar(user.id, data, file.content_type)
+    user.avatar_url = url
+    user.updated_at = now()
+    await audit(db, user.id, "avatar.uploaded", user.id if user.role == "client" else None)
+    return {"user": tokens.user_json(user)}
+
+
+@router.delete("/avatar")
+async def remove_avatar(user: CurrentUser, db: DB):
+    user.avatar_url = None
+    user.updated_at = now()
     return {"user": tokens.user_json(user)}

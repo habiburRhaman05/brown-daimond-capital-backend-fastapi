@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     PUBLIC_API_URL: str = "http://localhost:8000"
     CORS_ORIGINS: str = ""
 
+    # Supabase Storage for file uploads (avatars)
+    SUPABASE_URL: str = ""
+    SUPABASE_SERVICE_KEY: str = ""
+
     # Email goes out through a GoHighLevel workflow triggered by this webhook
     GHL_WEBHOOK_URL: str = ""
     GHL_WEBHOOK_SECRET: str = ""
