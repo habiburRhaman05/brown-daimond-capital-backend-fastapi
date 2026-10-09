@@ -43,6 +43,19 @@ def ensure_bucket() -> None:
         client.create_bucket(Bucket=BUCKET)
 
 
+def detect_image_type(data: bytes) -> str | None:
+    """Identify the real image type from its leading bytes; the client-sent Content-Type is not trusted."""
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 def get_signed_url(key: str) -> str:
     """Generate a signed URL for a private object."""
     return _s3_client().generate_presigned_url(
@@ -73,6 +86,7 @@ async def upload_avatar(user_id: uuid.UUID, data: bytes, content_type: str) -> s
             ContentType=content_type,
         )
 
+    await delete_avatar(user_id, keep=key)  # drop a previous picture stored under another extension
     return key
 
 
@@ -88,16 +102,13 @@ def resolve_avatar_url(avatar_url: str | None) -> str | None:
         return None
 
 
-async def delete_avatar(user_id: uuid.UUID) -> None:
-    """Remove all avatar files for a user."""
+async def delete_avatar(user_id: uuid.UUID, keep: str | None = None) -> None:
+    """Remove a user's avatar files (best effort), except the key to keep."""
     client = _s3_client()
     try:
         resp = client.list_objects_v2(Bucket=BUCKET, Prefix=str(user_id), MaxKeys=10)
-        objects = resp.get("Contents", [])
-        if objects:
-            client.delete_objects(
-                Bucket=BUCKET,
-                Delete={"Objects": [{"Key": o["Key"]} for o in objects]},
-            )
+        stale = [{"Key": o["Key"]} for o in resp.get("Contents", []) if o["Key"] != keep]
+        if stale:
+            client.delete_objects(Bucket=BUCKET, Delete={"Objects": stale})
     except ClientError:
         pass

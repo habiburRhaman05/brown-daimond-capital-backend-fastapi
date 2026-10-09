@@ -217,6 +217,11 @@ async def test_submit_locks_then_change_requests_and_admin_flow(api, client_sess
     assert r.json()["request"]["status"] == "pending" and r.json()["request"]["decidedAt"] is None
     assert (await api.post("/api/admin/change-requests/not-a-uuid/resolve", json={}, headers=ah)).json()["error"] == "REQUEST_NOT_FOUND"
 
+    # resolving a request lets the client back in for 24h (by design); lock again for the checks below
+    assert (await api.get("/api/client/overview", headers=h)).json()["summary"]["state"] == "reopened"
+    assert (await api.post(f"/api/admin/clients/{cid}/lock", headers=ah)).json()["ok"]
+    assert (await api.get("/api/client/overview", headers=h)).json()["summary"]["state"] == "submitted"
+
     # admin views
     clients = (await api.get("/api/admin/clients", headers=ah)).json()["clients"]
     row = next(c for c in clients if c["id"] == cid)
@@ -335,7 +340,7 @@ async def test_logout_ends_refresh_tokens(api):
 
 async def test_each_email_type_sends_its_own_payload(api, admin, outbox):
     ah = auth(admin)
-    common = {"type", "app", "sent_at", "to_email", "to_name", "login_url"}
+    common = {"type", "app", "sent_at", "to_email", "to_name", "login_url", "mailing_address"}
 
     email = unique_email("payload")
     await api.post("/api/auth/signup", json={"email": email, "password": "Password123!", "fullName": "Pay Load"})

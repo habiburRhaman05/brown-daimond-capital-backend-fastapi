@@ -1,5 +1,7 @@
 import uuid
 
+import structlog
+from botocore.exceptions import ClientError as S3Error
 from fastapi import APIRouter, BackgroundTasks, Request, UploadFile
 from fastapi.responses import RedirectResponse
 from sqlalchemy import update
@@ -13,11 +15,10 @@ from app.errors import ApiError
 from app.limiter import limiter
 from app.security import TokenError, decode_access_token, expiry, hash_password, now, password_ok, verify_password
 from app.services import tokens
-from botocore.exceptions import ClientError as S3Error
-
-from app.services.storage import ALLOWED_TYPES, MAX_SIZE, is_configured as storage_configured, upload_avatar
+from app.services.storage import ALLOWED_TYPES, MAX_SIZE, delete_avatar, detect_image_type, is_configured as storage_configured, upload_avatar
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+log = structlog.get_logger()
 
 _NO_STORE = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
 
@@ -224,6 +225,8 @@ async def update_profile(request: Request, user: CurrentUser, db: DB):
     changed = False
     name = body.get("fullName")
     if isinstance(name, str):
+        if not name.strip():
+            raise ApiError(400, "NAME_REQUIRED")
         user.full_name = name.strip()[:120]
         changed = True
     phone = body.get("phone")
@@ -240,17 +243,20 @@ async def update_profile(request: Request, user: CurrentUser, db: DB):
 @limiter.limit("20/15 minutes")
 async def upload_avatar_endpoint(request: Request, user: CurrentUser, db: DB, file: UploadFile):
     if not storage_configured():
-        raise ApiError(503, "STORAGE_NOT_CONFIGURED", "Avatar upload is not available. Configure Supabase storage first.")
+        raise ApiError(503, "STORAGE_NOT_CONFIGURED")
     if file.content_type not in ALLOWED_TYPES:
-        raise ApiError(400, "INVALID_FILE_TYPE", f"Allowed types: {', '.join(sorted(ALLOWED_TYPES))}")
-    data = await file.read()
+        raise ApiError(400, "INVALID_FILE_TYPE")
+    data = await file.read(MAX_SIZE + 1)  # never buffer more than one byte over the limit
     if len(data) > MAX_SIZE:
-        raise ApiError(400, "FILE_TOO_LARGE", "Maximum file size is 2 MB.")
+        raise ApiError(400, "FILE_TOO_LARGE")
+    if detect_image_type(data) != file.content_type:
+        raise ApiError(400, "INVALID_FILE_TYPE")
     try:
-        url = await upload_avatar(user.id, data, file.content_type)
+        key = await upload_avatar(user.id, data, file.content_type)
     except S3Error as exc:
-        raise ApiError(502, "UPLOAD_FAILED", f"Storage error: {exc}")
-    user.avatar_url = url
+        log.error("avatar_upload_failed", user_id=str(user.id), error=repr(exc))
+        raise ApiError(502, "UPLOAD_FAILED") from exc
+    user.avatar_url = key
     user.updated_at = now()
     await audit(db, user.id, "avatar.uploaded", user.id if user.role == "client" else None)
     return {"user": tokens.user_json(user)}
@@ -258,6 +264,8 @@ async def upload_avatar_endpoint(request: Request, user: CurrentUser, db: DB, fi
 
 @router.delete("/avatar")
 async def remove_avatar(user: CurrentUser, db: DB):
+    if storage_configured():
+        await delete_avatar(user.id)
     user.avatar_url = None
     user.updated_at = now()
     return {"user": tokens.user_json(user)}
