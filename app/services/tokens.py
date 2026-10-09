@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.db.models import AuthToken, Profile
 from app.security import create_access_token, expiry, hash_token, new_opaque_token, now
+from app.services.storage import resolve_avatar_url
 
 # Two tabs (the app and the portal page) can refresh with the same token at nearly the
 # same moment. A refresh token that was just used keeps working for this long.
@@ -19,7 +20,7 @@ def user_json(user: Profile) -> dict:
         "email": user.email,
         "role": user.role,
         "fullName": user.full_name or "",
-        "avatarUrl": user.avatar_url or "",
+        "avatarUrl": resolve_avatar_url(user.avatar_url) or "",
         "phone": user.phone or "",
     }
 

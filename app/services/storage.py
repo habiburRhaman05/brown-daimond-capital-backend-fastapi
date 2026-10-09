@@ -13,6 +13,7 @@ from app.config import get_settings
 BUCKET = "avatars"
 MAX_SIZE = 2 * 1024 * 1024  # 2 MB
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+SIGNED_URL_EXPIRY = 7 * 24 * 3600  # 7 days
 
 
 @lru_cache
@@ -42,19 +43,49 @@ def ensure_bucket() -> None:
         client.create_bucket(Bucket=BUCKET)
 
 
+def get_signed_url(key: str) -> str:
+    """Generate a signed URL for a private object."""
+    return _s3_client().generate_presigned_url(
+        "get_object",
+        Params={"Bucket": BUCKET, "Key": key},
+        ExpiresIn=SIGNED_URL_EXPIRY,
+    )
+
+
 async def upload_avatar(user_id: uuid.UUID, data: bytes, content_type: str) -> str:
-    """Upload an avatar image and return its public URL. Overwrites any previous avatar."""
+    """Upload an avatar image and return the S3 object key."""
     ext = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"}.get(content_type, "jpg")
     key = f"{user_id}.{ext}"
 
-    _s3_client().put_object(
-        Bucket=BUCKET,
-        Key=key,
-        Body=io.BytesIO(data),
-        ContentType=content_type,
-    )
+    try:
+        _s3_client().put_object(
+            Bucket=BUCKET,
+            Key=key,
+            Body=io.BytesIO(data),
+            ContentType=content_type,
+        )
+    except ClientError:
+        ensure_bucket()
+        _s3_client().put_object(
+            Bucket=BUCKET,
+            Key=key,
+            Body=io.BytesIO(data),
+            ContentType=content_type,
+        )
 
-    return f"{get_settings().SUPABASE_URL.rstrip('/')}/storage/v1/object/public/{BUCKET}/{key}"
+    return key
+
+
+def resolve_avatar_url(avatar_url: str | None) -> str | None:
+    """Turn a stored avatar key into a signed URL for the frontend."""
+    if not avatar_url or not is_configured():
+        return None
+    if avatar_url.startswith("http"):
+        return avatar_url
+    try:
+        return get_signed_url(avatar_url)
+    except ClientError:
+        return None
 
 
 async def delete_avatar(user_id: uuid.UUID) -> None:

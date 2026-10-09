@@ -14,6 +14,7 @@ from app.errors import install_error_handlers
 from app.limiter import limiter
 from app.routes import admin, auth, portal, public
 from app.security import hash_password, now
+from app.services.storage import is_configured as storage_configured, ensure_bucket
 
 settings = get_settings()
 
@@ -55,6 +56,12 @@ async def lifespan(_: FastAPI):
         await bootstrap_admin()
     except Exception as exc:  # the API should still boot so /api/health can say what is wrong
         log.error("admin_bootstrap_failed", error=repr(exc))
+    if storage_configured():
+        try:
+            ensure_bucket()
+            log.info("storage_bucket_ready")
+        except Exception as exc:
+            log.error("storage_bucket_init_failed", error=repr(exc))
     log.info("startup", env=settings.ENV, db=db_configured())
     yield
     await close_db()

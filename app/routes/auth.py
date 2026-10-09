@@ -13,6 +13,8 @@ from app.errors import ApiError
 from app.limiter import limiter
 from app.security import TokenError, decode_access_token, expiry, hash_password, now, password_ok, verify_password
 from app.services import tokens
+from botocore.exceptions import ClientError as S3Error
+
 from app.services.storage import ALLOWED_TYPES, MAX_SIZE, is_configured as storage_configured, upload_avatar
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -244,7 +246,10 @@ async def upload_avatar_endpoint(request: Request, user: CurrentUser, db: DB, fi
     data = await file.read()
     if len(data) > MAX_SIZE:
         raise ApiError(400, "FILE_TOO_LARGE", "Maximum file size is 2 MB.")
-    url = await upload_avatar(user.id, data, file.content_type)
+    try:
+        url = await upload_avatar(user.id, data, file.content_type)
+    except S3Error as exc:
+        raise ApiError(502, "UPLOAD_FAILED", f"Storage error: {exc}")
     user.avatar_url = url
     user.updated_at = now()
     await audit(db, user.id, "avatar.uploaded", user.id if user.role == "client" else None)
