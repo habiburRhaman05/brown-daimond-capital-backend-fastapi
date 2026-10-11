@@ -3,7 +3,7 @@ import uuid
 import structlog
 from botocore.exceptions import ClientError as S3Error
 from fastapi import APIRouter, BackgroundTasks, Request, UploadFile
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 
@@ -47,21 +47,23 @@ async def signup(request: Request, db: DB, background: BackgroundTasks):
     if not password_ok(password):
         raise ApiError(400, "WEAK_PASSWORD")
 
-    # Hash before looking the address up, so a new and an existing address take the same time.
-    password_hash = await hash_password(password)
     existing = await profile_by_email(db, email)
     if existing is not None:
         if existing.email_verified_at is None and existing.is_active:
+            # They may have lost the first email. Returned (not raised) so the new token is committed
+            # and the background email still runs; an exception would roll back and skip both.
             await _queue_verify_email(db, background, existing)
-        return {"ok": True}
+            return JSONResponse({"error": "EMAIL_NOT_VERIFIED"}, status_code=409)
+        raise ApiError(409, "EMAIL_EXISTS")
 
+    password_hash = await hash_password(password)
     user = Profile(email=email, full_name=name, password_hash=password_hash, role="client")
     db.add(user)
     try:
         await db.flush()
-    except IntegrityError:
+    except IntegrityError as exc:  # someone registered this address a moment ago
         await db.rollback()
-        return {"ok": True}
+        raise ApiError(409, "EMAIL_EXISTS") from exc
     await audit(db, user.id, "client.signup", user.id, {"email": email, "via": "self"})
     await _queue_verify_email(db, background, user)
     return {"ok": True}
@@ -111,8 +113,11 @@ async def login(request: Request, db: DB):
         raise ApiError(400, "Email and password are required")
 
     user = await profile_by_email(db, normalize_email(email))
-    ok = await verify_password(password, user.password_hash if user else None)
-    if user is None or not ok or not user.is_active:
+    if user is None:
+        raise ApiError(404, "ACCOUNT_NOT_FOUND")
+    if not user.is_active:
+        raise ApiError(403, "ACCOUNT_DISABLED")
+    if not await verify_password(password, user.password_hash):
         raise ApiError(401, "INVALID_CREDENTIALS")
     if user.email_verified_at is None:
         raise ApiError(403, "EMAIL_NOT_VERIFIED")

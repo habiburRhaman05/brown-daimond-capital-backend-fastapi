@@ -4,6 +4,8 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy import select, text
 
@@ -62,6 +64,8 @@ async def lifespan(_: FastAPI):
             log.info("storage_bucket_ready")
         except Exception as exc:
             log.error("storage_bucket_init_failed", error=repr(exc))
+    else:
+        log.warning("storage_not_configured", hint="set SUPABASE_URL and SUPABASE_S3_ACCESS_KEY / SUPABASE_S3_SECRET_KEY to enable avatar uploads")
     log.info("startup", env=settings.ENV, db=db_configured())
     yield
     await close_db()
@@ -76,9 +80,20 @@ app = FastAPI(
     openapi_url=None if settings.is_production else "/openapi.json",
 )
 
+async def _catch_unhandled(request, call_next):
+    """Turn a crash into a JSON 500 *inside* the CORS layer. Starlette's own 500 handler sits outside
+    it, so without this the browser sees a CORS failure and the real status never reaches the app."""
+    try:
+        return await call_next(request)
+    except Exception as exc:
+        log.error("unhandled_error", path=request.url.path, error=repr(exc), exc_info=True)
+        return JSONResponse({"error": "SERVER_ERROR"}, status_code=500)
+
+
 app.state.limiter = limiter
 install_error_handlers(app)
 app.add_middleware(SlowAPIMiddleware)
+app.add_middleware(BaseHTTPMiddleware, dispatch=_catch_unhandled)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
@@ -122,4 +137,5 @@ async def health():
         "db": db_state,
         "jwt_configured": len(s.JWT_SECRET) >= 32,
         "email_webhook_configured": bool(s.GHL_WEBHOOK_URL),
+        "storage_configured": storage_configured(),
     }

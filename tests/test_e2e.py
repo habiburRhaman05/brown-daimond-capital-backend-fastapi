@@ -51,16 +51,16 @@ async def test_signup_requires_verification_then_logs_in(api, outbox):
     assert me.json()["user"]["id"] == s["user"]["id"]
 
 
-async def test_signup_validation_and_no_enumeration(api, client_session):
+async def test_signup_validation_and_duplicate_email(api, client_session):
     bad = [({"email": "nope", "password": "Password123!", "fullName": "x"}, "INVALID_EMAIL"),
            ({"email": unique_email("v"), "password": "short", "fullName": "x"}, "WEAK_PASSWORD"),
            ({"email": unique_email("v"), "password": "Password123!", "fullName": " "}, "NAME_REQUIRED")]
     for body, code in bad:
         r = await api.post("/api/auth/signup", json=body)
         assert (r.status_code, r.json()["error"]) == (400, code)
-    # an address that already exists gets the identical answer
+    # an address that already exists is told so, and the existing account is left alone
     r = await api.post("/api/auth/signup", json={"email": client_session["user"]["email"], "password": "Password123!", "fullName": "Dup"})
-    assert (r.status_code, r.json()) == (201, {"ok": True})
+    assert (r.status_code, r.json()["error"]) == (409, "EMAIL_EXISTS")
     r = await api.post("/api/auth/login", json={"email": client_session["user"]["email"], "password": client_session["password"]})
     assert r.status_code == 200  # the duplicate signup did not change the password
 
