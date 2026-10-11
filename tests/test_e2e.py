@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from app.db.models import SiteConfig
 from app.db.session import get_factory
-from tests.conftest import auth, unique_email
+from tests.conftest import as_session, auth, exchange, refresh_cookie, unique_email, with_cookie
 
 pytestmark = pytest.mark.asyncio(loop_scope="session")
 
@@ -35,7 +35,10 @@ async def test_signup_requires_verification_then_logs_in(api, outbox):
     r = await api.get(f"/api/auth/verify-email?token={token}")
     assert r.status_code == 302
     loc = r.headers["location"]
-    assert "/email-verified#" in loc and "type=verify" in loc and "access_token=" in loc
+    assert "/email-verified#grant=" in loc and "type=verify" in loc
+    assert "access_token" not in loc and "refresh_token" not in loc  # no session credentials in the URL
+    s = await exchange(api, loc)
+    assert s["user"]["email"] == email and refresh_cookie(r) is None
     r = await api.get(f"/api/auth/verify-email?token={token}")  # a mail scanner may open it twice
     assert r.headers["location"].endswith("/email-verified?status=already")  # no session on replay
     r = await api.get("/api/auth/verify-email?token=nonsense")
@@ -45,7 +48,8 @@ async def test_signup_requires_verification_then_logs_in(api, outbox):
     assert r.status_code == 200
     s = r.json()
     assert s["user"]["email"] == email and s["user"]["role"] == "client"
-    assert s["expires_in"] == 3600 and s["expires_at"] > 0
+    assert s["expires_in"] == 900 and s["expires_at"] > 0
+    assert "refresh_token" not in s and refresh_cookie(r)  # the refresh token travels only in the HttpOnly cookie
 
     me = await api.get("/api/auth/me", headers=auth(s))
     assert me.json()["user"]["id"] == s["user"]["id"]
@@ -66,12 +70,13 @@ async def test_signup_validation_and_duplicate_email(api, client_session):
 
 
 async def test_refresh_rotates_and_rejects_garbage(api, client_session):
-    r = await api.post("/api/auth/refresh", json={"refresh_token": client_session["refresh_token"]})
+    r = await api.post("/api/auth/refresh", headers=with_cookie(client_session["refresh_token"]))
     assert r.status_code == 200
-    new = r.json()
-    assert new["access_token"] and new["refresh_token"] != client_session["refresh_token"] and "user" not in new
+    new = as_session(r)
+    assert new["access_token"] and new["refresh_token"] and new["refresh_token"] != client_session["refresh_token"]
+    assert "refresh_token" not in r.json() and r.json()["user"]["id"] == client_session["user"]["id"]
     assert (await api.get("/api/auth/me", headers=auth(new))).status_code == 200
-    r = await api.post("/api/auth/refresh", json={"refresh_token": "garbage"})
+    r = await api.post("/api/auth/refresh", headers=with_cookie("garbage"))
     assert (r.status_code, r.json()["error"]) == (401, "REFRESH_FAILED")
 
 
@@ -104,10 +109,9 @@ async def test_forgot_and_reset_password(api, outbox):
     r = await api.get(f"/api/auth/redeem?token={token}")
     assert r.status_code == 302
     loc = r.headers["location"]
-    assert "/set-password#access_token=" in loc and "refresh_token=" in loc
-    access = loc.split("access_token=")[1].split("&")[0]
+    assert "/set-password#grant=" in loc and "access_token" not in loc and "refresh_token" not in loc
 
-    h = {"Authorization": "Bearer " + access}
+    h = auth(await exchange(api, loc))
     assert (await api.post("/api/auth/set-password", json={"password": "short"}, headers=h)).json()["error"] == "WEAK_PASSWORD"
     r = await api.post("/api/auth/set-password", json={"password": "BrandNew123!"}, headers=h)
     assert r.json() == {"ok": True, "email": email}
@@ -264,8 +268,7 @@ async def test_invite_flow(api, admin, outbox):
     assert (await api.post("/api/auth/login", json={"email": email, "password": "Anything123!"})).status_code == 401
 
     r = await api.get(f"/api/auth/redeem?token={outbox.token_in(email, 'invite')}")
-    access = r.headers["location"].split("access_token=")[1].split("&")[0]
-    r = await api.post("/api/auth/set-password", json={"password": "InvitePass123!"}, headers={"Authorization": "Bearer " + access})
+    r = await api.post("/api/auth/set-password", json={"password": "InvitePass123!"}, headers=auth(await exchange(api, r.headers["location"])))
     assert r.json()["email"] == email
     assert (await api.post("/api/auth/login", json={"email": email, "password": "InvitePass123!"})).status_code == 200
 
@@ -332,9 +335,10 @@ async def test_logout_ends_refresh_tokens(api):
     async with get_factory()() as db:
         db.add(Profile(email=email, full_name="Bye", email_verified_at=now(), password_hash=await hash_password(pw)))
         await db.commit()
-    s = (await api.post("/api/auth/login", json={"email": email, "password": pw})).json()
-    assert (await api.post("/api/auth/logout", headers=auth(s))).json() == {"ok": True}
-    r = await api.post("/api/auth/refresh", json={"refresh_token": s["refresh_token"]})
+    s = as_session(await api.post("/api/auth/login", json={"email": email, "password": pw}))
+    r = await api.post("/api/auth/logout", headers={**auth(s), **with_cookie(s["refresh_token"])})
+    assert r.json() == {"ok": True}
+    r = await api.post("/api/auth/refresh", headers=with_cookie(s["refresh_token"]))
     assert r.status_code == 401
 
 
@@ -367,8 +371,8 @@ async def test_change_password_signs_out_other_sessions(api):
     async with get_factory()() as db:
         db.add(Profile(email=email, full_name="Chg", email_verified_at=now(), password_hash=await hash_password(old)))
         await db.commit()
-    first = (await api.post("/api/auth/login", json={"email": email, "password": old})).json()
-    other = (await api.post("/api/auth/login", json={"email": email, "password": old})).json()
+    first = as_session(await api.post("/api/auth/login", json={"email": email, "password": old}))
+    other = as_session(await api.post("/api/auth/login", json={"email": email, "password": old}))
     h = auth(first)
 
     for body, code in (({"currentPassword": "nope", "newPassword": new}, "WRONG_PASSWORD"),
@@ -381,8 +385,10 @@ async def test_change_password_signs_out_other_sessions(api):
     r = await api.post("/api/auth/change-password", json={"currentPassword": old, "newPassword": new}, headers=h)
     fresh = r.json()["session"]
     assert r.json()["ok"] and fresh["user"]["email"] == email
+    assert "refresh_token" not in fresh and refresh_cookie(r)  # the new cookie replaces the old one
     assert (await api.get("/api/auth/me", headers=auth(fresh))).status_code == 200
-    assert (await api.post("/api/auth/refresh", json={"refresh_token": other["refresh_token"]})).status_code == 401
+    assert (await api.post("/api/auth/refresh", headers=with_cookie(other["refresh_token"]))).status_code == 401
+    assert (await api.post("/api/auth/refresh", headers=with_cookie(refresh_cookie(r)))).status_code == 200
     assert (await api.post("/api/auth/login", json={"email": email, "password": old})).status_code == 401
     assert (await api.post("/api/auth/login", json={"email": email, "password": new})).status_code == 200
 
@@ -397,8 +403,7 @@ async def test_admin_can_reset_own_password_by_email(api, outbox):
     await api.post("/api/auth/forgot-password", json={"email": email})
     assert outbox.link_to(email, "reset_password")
     r = await api.get(f"/api/auth/redeem?token={outbox.token_in(email, 'reset_password')}")
-    access = r.headers["location"].split("access_token=")[1].split("&")[0]
-    r = await api.post("/api/auth/set-password", json={"password": "AdminNew123!"}, headers={"Authorization": "Bearer " + access})
+    r = await api.post("/api/auth/set-password", json={"password": "AdminNew123!"}, headers=auth(await exchange(api, r.headers["location"])))
     assert r.json()["email"] == email
     s = (await api.post("/api/auth/login", json={"email": email, "password": "AdminNew123!"})).json()
     assert s["user"]["role"] == "admin"

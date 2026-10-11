@@ -21,6 +21,34 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 log = structlog.get_logger()
 
 _NO_STORE = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+COOKIE_PATH = "/api/auth"  # the refresh cookie is only ever sent to the auth endpoints
+
+
+def _set_refresh_cookie(response, raw: str) -> None:
+    s = get_settings()
+    response.set_cookie(s.REFRESH_COOKIE_NAME, raw, max_age=s.REFRESH_TOKEN_TTL_DAYS * 86400,
+                        httponly=True, secure=s.is_production, samesite="lax", path=COOKIE_PATH)
+
+
+def _clear_refresh_cookie(response) -> None:
+    s = get_settings()
+    response.delete_cookie(s.REFRESH_COOKIE_NAME, path=COOKIE_PATH, httponly=True, secure=s.is_production, samesite="lax")
+
+
+def session_response(session: dict, **extra) -> JSONResponse:
+    """JSON for the browser app plus the refresh token as an HttpOnly cookie. The refresh token is
+    never part of the body, so scripts running on the page (including injected ones) cannot read it."""
+    resp = JSONResponse({**{k: v for k, v in session.items() if k != "refresh_token"}, **extra})
+    _set_refresh_cookie(resp, session["refresh_token"])
+    return resp
+
+
+def _check_origin(request: Request) -> None:
+    """Defence in depth on top of SameSite=Lax: a browser POST that names a foreign origin is refused.
+    Requests with no Origin header (curl, server-to-server) carry no browser cookie jar, so they pass."""
+    origin = request.headers.get("origin")
+    if origin and not get_settings().origin_allowed(origin):
+        raise ApiError(403, "BAD_ORIGIN")
 
 
 def _frontend(path: str) -> str:
@@ -85,8 +113,8 @@ async def resend_verification(request: Request, db: DB, background: BackgroundTa
 @limiter.limit("60/15 minutes")
 async def verify_email(request: Request, db: DB, token: str = ""):
     """Lands on /email-verified. Only the click that actually performs the verification
-    (the first one) gets a one-time session in the redirect fragment, same mechanism as
-    /redeem. A mail scanner may open the link before the person does, or the person may
+    (the first one) gets a one-time sign-in grant in the redirect fragment, same mechanism as
+    /redeem; the app trades it for a session at /exchange. A mail scanner may open the link before the person does, or the person may
     open a forwarded/stale copy afterwards; either way that replay gets no session at all,
     just the "already verified" state, so the link can never become a reusable backdoor."""
     row = await tokens.find_link_token(db, token, ("verify_email",))
@@ -97,10 +125,8 @@ async def verify_email(request: Request, db: DB, token: str = ""):
         user.email_verified_at = now()
         row.used_at = now()
         await audit(db, user.id, "email.verified", user.id)
-        session = await tokens.issue_session(db, user, with_user=False)
-        fragment = (f"access_token={session['access_token']}&refresh_token={session['refresh_token']}"
-                    f"&expires_in={session['expires_in']}&type=verify")
-        return RedirectResponse(_frontend("/email-verified#" + fragment), status_code=302, headers=_NO_STORE)
+        grant = await _new_grant(db, user)
+        return RedirectResponse(_frontend(f"/email-verified#grant={grant}&type=verify"), status_code=302, headers=_NO_STORE)
     return RedirectResponse(_frontend("/email-verified?status=already"), status_code=302, headers=_NO_STORE)
 
 
@@ -124,31 +150,70 @@ async def login(request: Request, db: DB):
 
     user.last_login_at = now()
     await tokens.purge_expired(db)
-    return await tokens.issue_session(db, user)
+    return session_response(await tokens.issue_session(db, user))
 
 
 @router.post("/refresh")
 @limiter.limit("120/15 minutes")
 async def refresh(request: Request, db: DB):
-    body = await read_json(request)
-    raw = body.get("refresh_token")
-    if not isinstance(raw, str) or not raw:
-        raise ApiError(400, "refresh_token required")
-    result = await tokens.rotate_refresh(db, raw)
+    """Trade the refresh cookie for a new access token (and a rotated cookie). The refresh token is
+    read only from the HttpOnly cookie, never from the request body."""
+    _check_origin(request)
+    raw = request.cookies.get(get_settings().REFRESH_COOKIE_NAME)
+    result = await tokens.rotate_refresh(db, raw) if raw else None
     if result is None:
-        raise ApiError(401, "REFRESH_FAILED")
-    return result[1]
+        failed = JSONResponse({"error": "REFRESH_FAILED"}, status_code=401)
+        if raw:
+            _clear_refresh_cookie(failed)  # a dead cookie should not be retried on every page load
+        return failed
+    user, session = result
+    return session_response(session, user=tokens.user_json(user))
+
+
+async def _new_grant(db, user: Profile) -> str:
+    return await tokens.create_link_token(db, user.id, "session_grant", expiry(minutes=get_settings().GRANT_TTL_MINUTES))
+
+
+@router.post("/exchange")
+@limiter.limit("30/15 minutes")
+async def exchange(request: Request, db: DB):
+    """Trade the one-time grant from an emailed link (verify / invite / reset) for a real session.
+    The grant is short-lived and single-use, so the address bar never holds a lasting credential."""
+    _check_origin(request)
+    body = await read_json(request)
+    raw = body.get("grant")
+    row = await tokens.find_link_token(db, raw if isinstance(raw, str) else "", ("session_grant",))
+    user = await db.get(Profile, row.user_id) if row is not None else None
+    if user is None or not user.is_active or user.email_verified_at is None or row.used_at is not None or row.expires_at <= now():
+        raise ApiError(401, "GRANT_INVALID")
+    # Claim the grant atomically: of several simultaneous requests carrying the same grant, only one wins.
+    claimed = await db.execute(update(AuthToken).where(AuthToken.id == row.id, AuthToken.used_at.is_(None)).values(used_at=now()))
+    if claimed.rowcount != 1:
+        raise ApiError(401, "GRANT_INVALID")
+    return session_response(await tokens.issue_session(db, user))
 
 
 @router.post("/logout")
 async def logout(request: Request, db: DB):
+    """Ends the user's sessions and clears the cookie. The user is identified by the access token
+    if it is still valid, otherwise by the refresh cookie, so an expired access token cannot stop a sign-out."""
+    _check_origin(request)
+    user_id = None
     raw = bearer_token(request)
     if raw:
         try:
-            await tokens.revoke_sessions(db, uuid.UUID(decode_access_token(raw)["sub"]))
-        except (TokenError, ValueError):
+            user_id = uuid.UUID(decode_access_token(raw)["sub"])
+        except (TokenError, ValueError, KeyError):
             pass
-    return {"ok": True}
+    cookie = request.cookies.get(get_settings().REFRESH_COOKIE_NAME)
+    if user_id is None and cookie:
+        row = await tokens.find_link_token(db, cookie, ("refresh",))
+        user_id = row.user_id if row is not None else None
+    if user_id is not None:
+        await tokens.revoke_sessions(db, user_id)
+    resp = JSONResponse({"ok": True})
+    _clear_refresh_cookie(resp)
+    return resp
 
 
 @router.post("/forgot-password")
@@ -169,7 +234,7 @@ async def forgot_password(request: Request, db: DB, background: BackgroundTasks)
 @limiter.limit("60/15 minutes")
 async def redeem(request: Request, db: DB, token: str = ""):
     """Landing point for invite and password-reset emails: turns the one-time link into a
-    session and hands it to the app's /set-password page. The link stays valid until a
+    sign-in grant and hands it to the app's /set-password page (which trades it at /exchange). The link stays valid until a
     password is actually set, so a mail scanner opening it first does not burn it."""
     row = await tokens.find_link_token(db, token, ("invite", "reset_password"))
     user = await db.get(Profile, row.user_id) if row is not None else None
@@ -177,10 +242,9 @@ async def redeem(request: Request, db: DB, token: str = ""):
         return RedirectResponse(_frontend("/set-password"), status_code=302, headers=_NO_STORE)
     if user.email_verified_at is None:
         user.email_verified_at = now()
-    session = await tokens.issue_session(db, user, with_user=False)
-    fragment = (f"access_token={session['access_token']}&refresh_token={session['refresh_token']}"
-                f"&expires_in={session['expires_in']}&type={'invite' if row.kind == 'invite' else 'recovery'}")
-    return RedirectResponse(_frontend("/set-password#" + fragment), status_code=302, headers=_NO_STORE)
+    grant = await _new_grant(db, user)
+    kind = "invite" if row.kind == "invite" else "recovery"
+    return RedirectResponse(_frontend(f"/set-password#grant={grant}&type={kind}"), status_code=302, headers=_NO_STORE)
 
 
 @router.post("/set-password")
@@ -216,7 +280,10 @@ async def change_password(request: Request, user: CurrentUser, db: DB):
     user.updated_at = now()
     await tokens.revoke_sessions(db, user.id)
     await audit(db, user.id, "password.changed", user.id if user.role == "client" else None)
-    return {"ok": True, "session": await tokens.issue_session(db, user)}
+    session = await tokens.issue_session(db, user)
+    resp = JSONResponse({"ok": True, "session": {k: v for k, v in session.items() if k != "refresh_token"}})
+    _set_refresh_cookie(resp, session["refresh_token"])
+    return resp
 
 
 @router.get("/me")

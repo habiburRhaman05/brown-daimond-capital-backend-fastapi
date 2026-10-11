@@ -9,7 +9,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy import select, text
 
-from app.config import get_settings
+from app.config import PREVIEW_ORIGIN_REGEX, get_settings
 from app.db.models import Profile
 from app.db.session import close_db, db_configured, get_factory
 from app.errors import install_error_handlers
@@ -97,7 +97,7 @@ app.add_middleware(BaseHTTPMiddleware, dispatch=_catch_unhandled)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
-    allow_origin_regex=r"^https://[a-z0-9-]+\.vercel\.app$",
+    allow_origin_regex=PREVIEW_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],

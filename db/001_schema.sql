@@ -48,7 +48,7 @@ CREATE INDEX idx_profiles_role ON profiles (role, created_at DESC);
 CREATE TABLE auth_tokens (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id     UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-  kind        TEXT NOT NULL CHECK (kind IN ('refresh', 'verify_email', 'reset_password', 'invite')),
+  kind        TEXT NOT NULL CHECK (kind IN ('refresh', 'verify_email', 'reset_password', 'invite', 'session_grant')),
   token_hash  TEXT NOT NULL UNIQUE,
   expires_at  TIMESTAMPTZ NOT NULL,
   used_at     TIMESTAMPTZ,

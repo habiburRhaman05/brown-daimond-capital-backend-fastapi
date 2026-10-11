@@ -1,3 +1,4 @@
+import http.cookiejar
 import os
 import re
 import uuid
@@ -15,6 +16,7 @@ from app.main import app  # noqa: E402
 from app.security import hash_password, now  # noqa: E402
 
 DOMAIN = "@e2e.test.invalid"
+COOKIE = "bdcap_rt"  # the HttpOnly refresh cookie
 
 
 class Outbox:
@@ -50,6 +52,9 @@ async def outbox():
 @pytest_asyncio.fixture(scope="session", loop_scope="session")
 async def api(outbox):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # One shared client serves many users, so it must not keep cookies of its own: tests pass the
+        # refresh cookie explicitly (see refresh_cookie / with_cookie), exactly like separate browsers would.
+        client.cookies.jar.set_policy(http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
         yield client
     async with get_factory()() as db:
         ids = [r for r in (await db.execute(select(Profile.id).where(Profile.email.like("%" + DOMAIN)))).scalars()]
@@ -69,6 +74,33 @@ def auth(session: dict) -> dict:
     return {"Authorization": "Bearer " + session["access_token"]}
 
 
+def refresh_cookie(resp) -> str | None:
+    """The refresh token a response set in its cookie, or None if it set none (or cleared it)."""
+    for header in resp.headers.get_list("set-cookie"):
+        m = re.match(rf"{COOKIE}=([^;]*)", header)
+        if m:
+            return m.group(1).strip('"') or None
+    return None
+
+
+def with_cookie(token: str | None) -> dict:
+    return {"Cookie": f"{COOKIE}={token}"} if token else {}
+
+
+def as_session(resp) -> dict:
+    """A login/exchange response as a session dict. The refresh token is read from the cookie, because
+    it is deliberately absent from the JSON body."""
+    return {**resp.json(), "refresh_token": refresh_cookie(resp)}
+
+
+async def exchange(api, location: str) -> dict:
+    """What the app does after an emailed link: take the one-time grant from the redirect URL and trade it."""
+    grant = re.search(r"grant=([\w-]+)", location).group(1)
+    r = await api.post("/api/auth/exchange", json={"grant": grant})
+    assert r.status_code == 200, r.text
+    return as_session(r)
+
+
 @pytest_asyncio.fixture(scope="session", loop_scope="session")
 async def admin(api):
     """A throwaway admin (never the real one), signed in."""
@@ -79,7 +111,7 @@ async def admin(api):
         await db.commit()
     r = await api.post("/api/auth/login", json={"email": email, "password": password})
     assert r.status_code == 200, r.text
-    return r.json()
+    return as_session(r)
 
 
 @pytest_asyncio.fixture(scope="session", loop_scope="session")
@@ -93,7 +125,7 @@ async def client_session(api, outbox):
     assert r.status_code == 302
     r = await api.post("/api/auth/login", json={"email": email, "password": password})
     assert r.status_code == 200, r.text
-    return {**r.json(), "password": password}
+    return {**as_session(r), "password": password}
 
 
 # ── storage fake ───────────────────────────────────────────────────────────────

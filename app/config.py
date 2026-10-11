@@ -1,6 +1,10 @@
+import re
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Preview deployments of the frontend live on vercel.app; shared by CORS and the CSRF origin check.
+PREVIEW_ORIGIN_REGEX = r"^https://[a-z0-9-]+\.vercel\.app$"
 
 
 class Settings(BaseSettings):
@@ -12,8 +16,10 @@ class Settings(BaseSettings):
 
     # Custom JWT auth
     JWT_SECRET: str = ""
-    ACCESS_TOKEN_TTL_SECONDS: int = 3600
+    ACCESS_TOKEN_TTL_SECONDS: int = 900  # kept in browser memory only, so it can be short
     REFRESH_TOKEN_TTL_DAYS: int = 30
+    REFRESH_COOKIE_NAME: str = "bdcap_rt"  # HttpOnly cookie that carries the refresh token
+    GRANT_TTL_MINUTES: int = 5  # one-time sign-in handoff after an emailed link
     VERIFY_EMAIL_TTL_HOURS: int = 24
     RESET_PASSWORD_TTL_MINUTES: int = 60
     INVITE_TTL_DAYS: int = 7
@@ -61,6 +67,10 @@ class Settings(BaseSettings):
         if not self.is_production:
             out += ["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000"]
         return sorted(set(out))
+
+    def origin_allowed(self, origin: str) -> bool:
+        origin = origin.strip().rstrip("/")
+        return origin in self.cors_origin_list or re.match(PREVIEW_ORIGIN_REGEX, origin) is not None
 
 
 @lru_cache
